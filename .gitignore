@@ -1,0 +1,10 @@
+# Logs and runtime files
+logs/
+*.log
+
+# Large JSON feeds (only CSVs are tracked)
+*.json
+iocs/*.json
+
+# macOS system files
+.DS_Store
