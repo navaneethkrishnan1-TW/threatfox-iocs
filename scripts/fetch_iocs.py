@@ -23,7 +23,7 @@ import csv
 import subprocess
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Configuration
 API_URL = "https://threatfox-api.abuse.ch/api/v1/"
@@ -40,6 +40,7 @@ os.makedirs(IOCS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 LOG_FILE = os.path.join(LOGS_DIR, "fetch.log")
+STATE_FILE = os.path.join(LOGS_DIR, "last_run.json")
 
 def log(msg: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -194,7 +195,107 @@ def git_commit_and_push(date_str: str):
     except Exception as e:
         log(f"Git automation error: {e}")
 
+def get_last_run_time():
+    """
+    Reads timestamp of the last successful run from state file,
+    falling back to git commit log or file modification date.
+    """
+    # 1. State file check
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                ts_str = data.get("last_run_timestamp")
+                if ts_str:
+                    return datetime.fromisoformat(ts_str)
+        except Exception as e:
+            log(f"Notice: Failed reading state file {STATE_FILE}: {e}")
+
+    # 2. Git commit history fallback
+    try:
+        res = subprocess.run(
+            ["git", "log", "-1", "--format=%cI"],
+            cwd=BASE_DIR, capture_output=True, text=True
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return datetime.fromisoformat(res.stdout.strip())
+    except Exception:
+        pass
+
+    # 3. Latest CSV file mtime fallback
+    latest_csv = os.path.join(IOCS_DIR, "latest.csv")
+    if os.path.exists(latest_csv):
+        return datetime.fromtimestamp(os.path.getmtime(latest_csv)).astimezone()
+
+    return None
+
+def update_last_run(iocs_count: int, status: str = "success"):
+    """Records the execution result and timestamp into STATE_FILE."""
+    now_iso = datetime.now().astimezone().isoformat()
+    data = {
+        "last_run_timestamp": now_iso,
+        "status": status,
+        "iocs_count": iocs_count,
+        "date": datetime.now().strftime("%Y-%m-%d")
+    }
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log(f"Warning: Failed updating {STATE_FILE}: {e}")
+
+def should_run(force: bool = False):
+    """
+    Evaluates whether ingestion should run based on the daily 6:00 PM (18:00) schedule:
+    - If current time < 18:00 (before 6 PM): checks if it ran for yesterday's 6 PM cycle.
+      If it did not run after yesterday 18:00, it runs and pushes immediately.
+    - If current time >= 18:00 (6 PM or later): checks if it ran for today's 6 PM cycle.
+      If it did not run after today 18:00, it runs and pushes.
+    - If already run for the expected cycle, skips gracefully.
+    """
+    if force:
+        return True, "Forced execution flag passed (--force)."
+
+    now = datetime.now().astimezone()
+
+    # Determine cutoff milestone (the most recent 6:00 PM that should have executed)
+    if now.hour >= 18:
+        # Today at or past 18:00 -> cutoff is today at 18:00
+        cutoff = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        milestone = "today's 6:00 PM milestone"
+    else:
+        # Current time is not yet 6:00 PM today -> cutoff is yesterday at 18:00
+        cutoff = (now - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+        milestone = "yesterday's 6:00 PM milestone"
+
+    last_run = get_last_run_time()
+    if last_run is None:
+        return True, "No record of previous run found. Ingestion required."
+
+    # Normalize timezone for comparison
+    if last_run.tzinfo is None:
+        last_run = last_run.replace(tzinfo=now.tzinfo)
+
+    if last_run < cutoff:
+        return True, (
+            f"Last run was {last_run.strftime('%Y-%m-%d %H:%M:%S')}, which is before "
+            f"{milestone} ({cutoff.strftime('%Y-%m-%d %H:%M:%S')}). Need to catch up and push."
+        )
+    else:
+        return False, (
+            f"Already ran at {last_run.strftime('%Y-%m-%d %H:%M:%S')} (after "
+            f"{milestone} at {cutoff.strftime('%Y-%m-%d %H:%M:%S')}). Skipping."
+        )
+
 def main():
+    force = "--force" in sys.argv
+    run_needed, reason = should_run(force=force)
+
+    log(f"Schedule check: {reason}")
+    if not run_needed:
+        log("Execution skipped: condition for scheduled run is satisfied.")
+        return
+
     date_str = datetime.now().strftime("%Y-%m-%d")
     log("=== Starting ThreatFox Daily Ingestion ===")
     try:
@@ -206,9 +307,11 @@ def main():
 
         save_results(matched, date_str)
         git_commit_and_push(date_str)
+        update_last_run(len(matched), status="success")
         log("=== Ingestion Complete ===")
     except Exception as e:
         log(f"ERROR: Execution failed: {e}")
+        update_last_run(0, status=f"failed: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
