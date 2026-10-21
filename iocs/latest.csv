@@ -1,4 +1,5 @@
 id,ioc,ioc_type,threat_type,malware_printable,confidence_level,first_seen,matched_criteria,tags,reporter,malware_malpedia,reference
+1978127,9eabfb31f281ed61b993abe535472ef490a7ac5b94a78e9e229beae92b80b2cf,sha256_hash,payload,AMOS,100,2026-10-21 12:29:29 UTC,clickfix,"Amos, ClickFix, Foxveil, macOS, quill",c4ffeine,https://malpedia.caad.fkie.fraunhofer.de/details/osx.amos,https://www.virustotal.com/gui/file/9eabfb31f281ed61b993abe535472ef490a7ac5b94a78e9e229beae92b80b2cf
 1978126,https://z.a9bet.org/z,url,botnet_cc,Vidar,100,2026-10-21 12:26:11 UTC,"c2, c2 (threat_type), stealer","c2, ec141392be2e474ab700bf353b3b9f2c, Loader, stealer, Vidar",Bitsight,https://malpedia.caad.fkie.fraunhofer.de/details/win.vidar,
 1978125,https://s8.abc212.org/rpr/,url,botnet_cc,Vidar,100,2026-10-21 12:25:48 UTC,c2 (threat_type),Vidar,crep1x,https://malpedia.caad.fkie.fraunhofer.de/details/win.vidar,
 1978123,https://s8.abc212.org/v0/,url,botnet_cc,Vidar,100,2026-10-21 12:20:48 UTC,c2 (threat_type),Vidar,crep1x,https://malpedia.caad.fkie.fraunhofer.de/details/win.vidar,
