@@ -24,6 +24,10 @@ import subprocess
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
+import time
+import math
+import fcntl
+from datetime import timezone
 
 # Configuration
 API_URL = "https://threatfox-api.abuse.ch/api/v1/"
@@ -94,8 +98,8 @@ def fetch_daily_iocs(days: int = 1) -> list:
 
     status = data.get("query_status")
     if status != "ok":
-        log(f"API returned non-ok status: {status}")
-        return []
+        # Never save an empty file for a failed query; let the caller retry on the next hourly run.
+        raise RuntimeError(f"API returned non-ok status: {status}")
 
     return data.get("data", [])
 
@@ -119,7 +123,7 @@ def filter_iocs(raw_iocs: list) -> list:
 
     return matched
 
-def save_results(matched_iocs: list, date_str: str):
+def save_results(matched_iocs: list, date_str: str, update_latest: bool = True):
     json_path = os.path.join(IOCS_DIR, f"{date_str}.json")
     csv_path = os.path.join(IOCS_DIR, f"{date_str}.csv")
     latest_json = os.path.join(IOCS_DIR, "latest.json")
@@ -145,75 +149,75 @@ def save_results(matched_iocs: list, date_str: str):
             row["matched_criteria"] = ", ".join(item.get("matched_criteria") or [])
             writer.writerow(row)
 
-    # 3. Update 'latest' references
-    with open(latest_json, "w", encoding="utf-8") as f:
-        json.dump(matched_iocs, f, indent=2)
+    # 3. Update 'latest' references (only for the newest day when catching up several days)
+    if update_latest:
+        with open(latest_json, "w", encoding="utf-8") as f:
+            json.dump(matched_iocs, f, indent=2)
 
-    with open(latest_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_columns, extrasaction="ignore")
-        writer.writeheader()
-        for item in matched_iocs:
-            row = dict(item)
-            row["tags"] = ", ".join(item.get("tags") or [])
-            row["matched_criteria"] = ", ".join(item.get("matched_criteria") or [])
-            writer.writerow(row)
+        with open(latest_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_columns, extrasaction="ignore")
+            writer.writeheader()
+            for item in matched_iocs:
+                row = dict(item)
+                row["tags"] = ", ".join(item.get("tags") or [])
+                row["matched_criteria"] = ", ".join(item.get("matched_criteria") or [])
+                writer.writerow(row)
 
     log(f"Successfully saved {len(matched_iocs)} filtered IOCs:")
     log(f"  -> JSON: {json_path}")
     log(f"  -> CSV:  {csv_path}")
 
-def git_commit_and_push(date_str: str):
-    """Stages only CSV files, commits, and pushes to remote repository."""
+def git_commit_and_push(labels: list) -> bool:
+    """Stages only CSV files, commits if anything changed, then pushes (also flushing earlier
+    unpushed commits). Returns False when the push failed so the caller can retry later."""
     try:
-        # Check if inside a git repository
         check_repo = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=BASE_DIR, capture_output=True, text=True
         )
         if check_repo.returncode != 0:
             log("Git: Not a git repository. Skipping git push.")
-            return
+            return True
 
-        # Stage only CSV files in iocs/
         subprocess.run(["git", "add", "iocs/*.csv"], cwd=BASE_DIR, check=True)
 
-        # Check if there are changes staged
         diff_res = subprocess.run(["git", "diff", "--staged", "--quiet"], cwd=BASE_DIR)
         if diff_res.returncode == 0:
             log("Git: No CSV changes detected to commit.")
-            return
+        else:
+            commit_msg = f"Update ThreatFox IOCs: {', '.join(labels)}"
+            subprocess.run(["git", "commit", "-m", commit_msg], cwd=BASE_DIR, check=True)
+            log(f"Git: Committed CSV updates ({commit_msg})")
 
-        # Commit changes
-        commit_msg = f"Update ThreatFox IOCs: {date_str}"
-        subprocess.run(["git", "commit", "-m", commit_msg], cwd=BASE_DIR, check=True)
-        log(f"Git: Committed CSV updates ({commit_msg})")
-
-        # Check if remote 'origin' is configured
         remotes = subprocess.run(["git", "remote"], cwd=BASE_DIR, capture_output=True, text=True).stdout.split()
         if "origin" not in remotes:
             log("Git: Remote 'origin' not configured yet. Changes committed locally.")
-            return
+            return True
 
-        # Get current branch
         branch_res = subprocess.run(
             ["git", "branch", "--show-current"],
             cwd=BASE_DIR, capture_output=True, text=True
         )
         branch = branch_res.stdout.strip() or "main"
 
-        # Push to remote
-        log(f"Git: Pushing CSV files to origin/{branch}...")
-        push_res = subprocess.run(
-            ["git", "push", "origin", branch],
-            cwd=BASE_DIR, capture_output=True, text=True
-        )
-        if push_res.returncode == 0:
-            log(f"Git: Successfully pushed to origin/{branch}")
-        else:
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        for attempt, delay in enumerate((0, 10, 30), start=1):
+            if delay:
+                time.sleep(delay)
+            log(f"Git: Pushing to origin/{branch} (attempt {attempt}/3)...")
+            push_res = subprocess.run(
+                ["git", "push", "origin", branch],
+                cwd=BASE_DIR, capture_output=True, text=True, env=env, timeout=120
+            )
+            if push_res.returncode == 0:
+                log(f"Git: Successfully pushed to origin/{branch}")
+                return True
             log(f"Git: Push failed. Output: {push_res.stderr.strip() or push_res.stdout.strip()}")
+        return False
 
     except Exception as e:
         log(f"Git automation error: {e}")
+        return False
 
 def get_last_run_time():
     """
@@ -250,14 +254,28 @@ def get_last_run_time():
     return None
 
 def update_last_run(iocs_count: int, status: str = "success"):
-    """Records the execution result and timestamp into STATE_FILE."""
+    """Records the execution result in STATE_FILE. Only a successful run advances
+    last_run_timestamp, so a failed run (network, API, push) is retried by the next hourly job."""
     now_iso = datetime.now().astimezone().isoformat()
-    data = {
-        "last_run_timestamp": now_iso,
-        "status": status,
-        "iocs_count": iocs_count,
-        "date": datetime.now().strftime("%Y-%m-%d")
-    }
+    existing = {}
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+    except Exception:
+        existing = {}
+
+    if status == "success":
+        data = {
+            "last_run_timestamp": now_iso,
+            "status": "success",
+            "iocs_count": iocs_count,
+            "date": datetime.now().strftime("%Y-%m-%d")
+        }
+    else:
+        data = dict(existing)
+        data["status"] = status
+        data["last_attempt_timestamp"] = now_iso
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -307,7 +325,50 @@ def should_run(force: bool = False):
             f"{milestone} at {cutoff.strftime('%Y-%m-%d %H:%M:%S')}). Skipping."
         )
 
+MAX_CATCHUP_DAYS = 6  # ThreatFox 'days' accepts 1-7; keep one day of margin
+
+def latest_milestone(now: datetime) -> datetime:
+    """Most recent 18:00 (local time) that should already have run."""
+    m = now.replace(hour=18, minute=0, second=0, microsecond=0)
+    return m if now >= m else m - timedelta(days=1)
+
+def pending_milestones(now: datetime, last_run) -> list:
+    """All 18:00 milestones after the last successful run, oldest first (at most MAX_CATCHUP_DAYS)."""
+    m = latest_milestone(now)
+    if last_run is None:
+        return [m]
+    if last_run.tzinfo is None:
+        last_run = last_run.replace(tzinfo=now.tzinfo)
+    out = []
+    while m > last_run and len(out) < MAX_CATCHUP_DAYS:
+        out.append(m)
+        m -= timedelta(days=1)
+    return sorted(out) or [latest_milestone(now)]
+
+def split_by_window(matched: list, milestones: list) -> dict:
+    """Assigns each IOC to the 24h window (milestone-24h, milestone] that contains its first_seen time."""
+    windows = {m: [] for m in milestones}
+    tz = milestones[0].tzinfo
+    for item in matched:
+        try:
+            ts = datetime.strptime(item["first_seen"], "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc).astimezone(tz)
+        except Exception:
+            continue
+        for m in milestones:
+            if m - timedelta(days=1) < ts <= m:
+                windows[m].append(item)
+                break
+    return windows
+
 def main():
+    # Prevent the LaunchAgent and the hourly cron from running at the same time.
+    lock_file = open(os.path.join(LOGS_DIR, ".run.lock"), "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("Another ingestion run is in progress; exiting.")
+        return
+
     force = "--force" in sys.argv
     run_needed, reason = should_run(force=force)
 
@@ -316,18 +377,29 @@ def main():
         log("Execution skipped: condition for scheduled run is satisfied.")
         return
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now().astimezone()
+    milestones = [latest_milestone(now)] if force else pending_milestones(now, get_last_run_time())
+    span_days = (now - (milestones[0] - timedelta(days=1))).total_seconds() / 86400
+    days = max(1, min(7, math.ceil(span_days)))
     log("=== Starting ThreatFox Daily Ingestion ===")
+    log(f"Catch-up days: {', '.join(m.strftime('%Y-%m-%d') for m in milestones)} (fetching last {days} day(s)).")
     try:
-        raw_iocs = fetch_daily_iocs(days=1)
+        raw_iocs = fetch_daily_iocs(days=days)
         log(f"Fetched {len(raw_iocs)} total raw IOCs from ThreatFox.")
 
         matched = filter_iocs(raw_iocs)
         log(f"Filtered {len(matched)} IOCs matching target tags ({', '.join(sorted(TARGET_TAGS))}).")
 
-        save_results(matched, date_str)
-        git_commit_and_push(date_str)
-        update_last_run(len(matched), status="success")
+        windows = split_by_window(matched, milestones)
+        labels = []
+        for m in milestones:
+            label = m.strftime("%Y-%m-%d")
+            save_results(windows[m], label, update_latest=(m == milestones[-1]))
+            labels.append(label)
+
+        if not git_commit_and_push(labels):
+            raise RuntimeError("git push failed after 3 attempts; commits are kept locally and retried by the next run")
+        update_last_run(len(windows[milestones[-1]]), status="success")
         log("=== Ingestion Complete ===")
     except Exception as e:
         log(f"ERROR: Execution failed: {e}")
