@@ -27,7 +27,9 @@ from datetime import datetime, timedelta
 
 # Configuration
 API_URL = "https://threatfox-api.abuse.ch/api/v1/"
-AUTH_KEY = os.environ.get("THREATFOX_AUTH_KEY", "9fd58d153e02f42d5ed3bd08544ea72c47b4ba33d0359a0c")
+# The API key is never stored in the repo. It is read from THREATFOX_AUTH_KEY or from
+# KEY_FILE (chmod 600, outside the repository).
+KEY_FILE = os.path.expanduser("~/.config/threatfox/auth_key")
 TARGET_TAGS = {"clickfix", "etherhiding", "c2", "stealer"}
 
 # Organized directory paths
@@ -52,13 +54,31 @@ def log(msg: str):
     except Exception as e:
         print(f"Failed writing log: {e}", file=sys.stderr)
 
+def get_auth_key() -> str:
+    """Return the ThreatFox Auth-Key from the environment or KEY_FILE, or exit with a clear error."""
+    key = os.environ.get("THREATFOX_AUTH_KEY", "").strip()
+    if key:
+        return key
+    try:
+        mode = os.stat(KEY_FILE).st_mode & 0o777
+        if mode & 0o077:
+            log(f"Warning: {KEY_FILE} is readable by group/others (mode {oct(mode)}); run: chmod 600 {KEY_FILE}")
+        with open(KEY_FILE, "r", encoding="utf-8") as f:
+            key = f.read().strip()
+    except FileNotFoundError:
+        key = ""
+    if not key:
+        log(f"ThreatFox Auth-Key not found. Set THREATFOX_AUTH_KEY or put the key in {KEY_FILE}")
+        sys.exit(2)
+    return key
+
 def fetch_daily_iocs(days: int = 1) -> list:
     payload = json.dumps({"query": "get_iocs", "days": days}).encode("utf-8")
     req = urllib.request.Request(
         API_URL,
         data=payload,
         headers={
-            "Auth-Key": AUTH_KEY,
+            "Auth-Key": get_auth_key(),
             "Content-Type": "application/json",
             "User-Agent": "ThreatHunting-DailyFetcher/1.0"
         }
